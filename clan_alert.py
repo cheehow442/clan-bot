@@ -3,17 +3,27 @@ import os
 import time
 import requests
 import ctypes
+import sys
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 CLASH_API_TOKEN = os.getenv("CLASH_API_TOKEN")
 CLAN_TAG = "%23RPYC8P2Y"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-CHECK_EVERY_SECONDS = 30
+CHECK_EVERY_SECONDS = 10
 STATE_FILE = "clan_members_state.json"
 MESSAGE_STATE_FILE = "telegram_message_state.json"
 HOURLY_SNAPSHOT_FILE = "hourly_trophy_snapshot.json"
 HOURLY_SUMMARY_SECONDS = 7200
+WAR_STATE_FILE = "war_state.json"
+
+LOCATION_CACHE_FILE = "location_cache.json"
+SG_RANK_CACHE_FILE = "sg_rank_cache.json"
+SG_RANK_CACHE_SECONDS = 600
+
+BOT_TIMEZONE = ZoneInfo("Asia/Singapore")
 
 CLASH_HEADERS = {
     "Authorization": f"Bearer {CLASH_API_TOKEN}"
@@ -22,12 +32,51 @@ CLASH_HEADERS = {
 ES_CONTINUOUS = 0x80000000
 ES_SYSTEM_REQUIRED = 0x00000001
 
+_instance_lock_file = None
+
+
+def ensure_single_instance():
+    global _instance_lock_file
+
+    if os.name == "nt":
+        mutex_name = "KopiOClanBotSingleInstance"
+
+        kernel32 = ctypes.windll.kernel32
+        mutex = kernel32.CreateMutexW(None, False, mutex_name)
+
+        ERROR_ALREADY_EXISTS = 183
+        if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+            log("Another instance is already running. Exiting...")
+            sys.exit(0)
+
+        return mutex
+
+    lock_path = "/tmp/KopiOClanBotSingleInstance.lock"
+
+    try:
+        import fcntl
+        _instance_lock_file = open(lock_path, "w")
+        fcntl.flock(_instance_lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _instance_lock_file.write(str(os.getpid()))
+        _instance_lock_file.flush()
+        return _instance_lock_file
+    except BlockingIOError:
+        log("Another instance is already running. Exiting...")
+        sys.exit(0)
+    except Exception as e:
+        log(f"Single-instance lock failed: {e}")
+        return None
+
 
 def log(message):
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}")
+    now_text = datetime.now(BOT_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{now_text}] {message}", flush=True)
 
 
 def keep_awake():
+    if os.name != "nt":
+        return
+
     try:
         ctypes.windll.kernel32.SetThreadExecutionState(
             ES_CONTINUOUS | ES_SYSTEM_REQUIRED
@@ -36,22 +85,32 @@ def keep_awake():
         log(f"Keep-awake failed: {e}")
 
 
-def clash_get(url):
-    try:
-        r = requests.get(url, headers=CLASH_HEADERS, timeout=20)
-    except requests.RequestException as e:
-        log(f"Clash API request error: {e}")
-        return None
+def format_sgt_timestamp(ts):
+    return datetime.fromtimestamp(ts, BOT_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
 
-    if r.status_code != 200:
-        log(f"Error fetching Clash API: {r.status_code} {r.text}")
-        return None
 
-    try:
-        return r.json()
-    except ValueError:
-        log("Failed to parse Clash API response as JSON.")
-        return None
+def clash_get(url, retries=3, delay_seconds=3):
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.get(url, headers=CLASH_HEADERS, timeout=20)
+        except requests.RequestException as e:
+            log(f"Clash API request error (attempt {attempt}/{retries}): {e}")
+            if attempt < retries:
+                time.sleep(delay_seconds)
+                continue
+            return None
+
+        if r.status_code != 200:
+            log(f"Error fetching Clash API: {r.status_code} {r.text}")
+            return None
+
+        try:
+            return r.json()
+        except ValueError:
+            log("Failed to parse Clash API response as JSON.")
+            return None
+
+    return None
 
 
 def get_player_details(player_tag):
@@ -149,6 +208,142 @@ def get_clan_score():
     return clan_score
 
 
+def load_location_cache():
+    if not os.path.exists(LOCATION_CACHE_FILE):
+        return None
+
+    try:
+        with open(LOCATION_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        log(f"Failed to load location cache file: {e}")
+        return None
+
+
+def save_location_cache(data):
+    try:
+        with open(LOCATION_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log(f"Failed to save location cache file: {e}")
+
+
+def load_sg_rank_cache():
+    if not os.path.exists(SG_RANK_CACHE_FILE):
+        return None
+
+    try:
+        with open(SG_RANK_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        log(f"Failed to load SG rank cache file: {e}")
+        return None
+
+
+def save_sg_rank_cache(rank_data, cache_time=None):
+    if cache_time is None:
+        cache_time = time.time()
+
+    data = {
+        "timestamp": cache_time,
+        "rank_data": rank_data
+    }
+
+    try:
+        with open(SG_RANK_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log(f"Failed to save SG rank cache file: {e}")
+
+
+def get_location_id_by_name(location_name):
+    cache = load_location_cache() or {}
+
+    cached_id = cache.get(location_name)
+    if cached_id is not None:
+        return cached_id
+
+    url = "https://api.clashroyale.com/v1/locations"
+    data = clash_get(url)
+
+    if not data:
+        return None
+
+    items = data.get("items", [])
+    for item in items:
+        if str(item.get("name", "")).strip().lower() == location_name.strip().lower():
+            location_id = item.get("id")
+            if location_id is not None:
+                cache[location_name] = location_id
+                save_location_cache(cache)
+                return location_id
+
+    return None
+
+
+def get_clan_rank_by_location(location_id, clan_tag):
+    clean_tag = clan_tag.replace("%23", "").replace("#", "").upper()
+    after = None
+
+    while True:
+        url = f"https://api.clashroyale.com/v1/locations/{location_id}/rankings/clans"
+        if after:
+            url += f"?after={after}"
+
+        data = clash_get(url)
+        if not data:
+            return None
+
+        items = data.get("items", [])
+        for clan in items:
+            api_tag = str(clan.get("tag", "")).replace("#", "").upper()
+            if api_tag == clean_tag:
+                return {
+                    "rank": clan.get("rank"),
+                    "name": clan.get("name"),
+                    "score": clan.get("clanScore"),
+                    "member_count": clan.get("memberCount"),
+                    "location_id": location_id
+                }
+
+        paging = data.get("paging", {}) or {}
+        cursors = paging.get("cursors", {}) or {}
+        after = cursors.get("after")
+
+        if not after:
+            break
+
+        time.sleep(0.2)
+
+    return None
+
+
+def get_sg_clan_rank():
+    cache_data = load_sg_rank_cache()
+
+    if cache_data:
+        cache_timestamp = cache_data.get("timestamp", 0)
+        rank_data = cache_data.get("rank_data")
+
+        if (time.time() - cache_timestamp) < SG_RANK_CACHE_SECONDS:
+            return rank_data
+
+    singapore_location_id = get_location_id_by_name("Singapore")
+    if singapore_location_id is None:
+        log("Failed to resolve Singapore location ID.")
+        return cache_data.get("rank_data") if cache_data else None
+
+    rank_data = get_clan_rank_by_location(singapore_location_id, CLAN_TAG)
+
+    if rank_data and rank_data.get("rank") is not None:
+        save_sg_rank_cache(rank_data)
+        log(f"Official API SG rank found: #{rank_data['rank']}")
+        return rank_data
+
+    log("Official API SG rank not found.")
+    return cache_data.get("rank_data") if cache_data else None
+
+
 def load_previous_members():
     if not os.path.exists(STATE_FILE):
         return None
@@ -215,6 +410,43 @@ def save_hourly_snapshot(members, snapshot_time=None):
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
         log(f"Failed to save hourly snapshot file: {e}")
+
+
+def load_war_state():
+    if not os.path.exists(WAR_STATE_FILE):
+        return None
+
+    try:
+        with open(WAR_STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        log(f"Failed to load war state file: {e}")
+        return None
+
+
+def save_war_state(data):
+    try:
+        with open(WAR_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log(f"Failed to save war state file: {e}")
+
+
+def get_current_river_race():
+    url = f"https://api.clashroyale.com/v1/clans/{CLAN_TAG}/currentriverrace"
+    return clash_get(url)
+
+
+def get_war_phase():
+    data = get_current_river_race()
+
+    if not data:
+        return None
+
+    return {
+        "periodType": data.get("periodType"),
+        "periodIndex": data.get("periodIndex")
+    }
 
 
 def send_telegram_message(text):
@@ -289,6 +521,7 @@ def build_full_clan_list_text(members):
     )
 
     clan_score = get_clan_score()
+    sg_rank_data = get_sg_clan_rank()
 
     lines = []
     for i, (tag, info) in enumerate(sorted_members, start=1):
@@ -305,6 +538,11 @@ def build_full_clan_list_text(members):
         f"📋 Kopi O current clan members ({len(sorted_members)}/50)\n"
         f"🏆 Clan Score: {clan_score}"
     )
+
+    if sg_rank_data and sg_rank_data.get("rank") is not None:
+        header += f"\n🇸🇬 SG Rank: #{sg_rank_data['rank']}"
+    else:
+        header += "\n🇸🇬 SG Rank: Not found"
 
     return header + "\n\n" + "\n\n".join(lines)
 
@@ -405,6 +643,44 @@ def send_leave_alerts(left_tags, previous_members, current_count):
         )
         send_telegram_message(msg)
         log(f"Leave sent: {name} ({tag})")
+
+
+def send_clan_war_started_alert(war_info):
+    day = war_info.get("periodIndex", "?")
+
+    msg = (
+        f"⚔️ Kopi O War Day {day} Started\n"
+        f"🔥 Good luck in battles!"
+    )
+    send_telegram_message(msg)
+
+
+def check_war_day_started():
+    previous_war = load_war_state()
+    current_war = get_war_phase()
+
+    if current_war is None:
+        log("Could not fetch current river race.")
+        return
+
+    previous_period = previous_war.get("periodType") if previous_war else None
+    previous_index = previous_war.get("periodIndex") if previous_war else None
+
+    current_period = current_war.get("periodType")
+    current_index = current_war.get("periodIndex")
+
+    if current_period == "warDay":
+        # First time entering war day
+        if previous_period != "warDay":
+            send_clan_war_started_alert(current_war)
+            log(f"War day {current_index} started alert sent.")
+
+        # War day number changed (1 -> 2 -> 3 -> 4)
+        elif previous_index != current_index:
+            send_clan_war_started_alert(current_war)
+            log(f"War day {current_index} started alert sent.")
+
+    save_war_state(current_war)
 
 
 def check_role_changes(previous_members, current_members):
@@ -540,8 +816,8 @@ def build_hourly_trophy_summary_text(snapshot_members, current_members, snapshot
     changed_players.sort(key=lambda x: (-x["diff"], x["name"].lower()))
     pol_changed_players.sort(key=lambda x: x["name"].lower())
 
-    start_time_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(snapshot_timestamp))
-    end_time_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    start_time_text = format_sgt_timestamp(snapshot_timestamp)
+    end_time_text = datetime.now(BOT_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
 
     total_changed_count = len(changed_players) + len(pol_changed_players)
 
@@ -630,10 +906,14 @@ def main():
         return
 
     keep_awake()
+    instance_mutex = ensure_single_instance()
     log("Bot started...")
+    log(f"Running file: {os.path.abspath(__file__)}")
+    log(f"Process ID: {os.getpid()}")
 
     previous_members = load_previous_members()
     current_members = get_clan_members()
+    check_war_day_started()
 
     if current_members is None:
         log("Failed to fetch clan members on startup. Bot will not continue.")
@@ -666,6 +946,7 @@ def main():
         try:
             keep_awake()
             current_members = get_clan_members()
+            check_war_day_started()
 
             if current_members is None:
                 log("Skipping this cycle because clan data could not be fetched.")

@@ -13,17 +13,21 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 CHECK_EVERY_SECONDS = 10
-STATE_FILE = "clan_members_state.json"
-MESSAGE_STATE_FILE = "telegram_message_state.json"
-HOURLY_SNAPSHOT_FILE = "hourly_trophy_snapshot.json"
 HOURLY_SUMMARY_SECONDS = 7200
-WAR_STATE_FILE = "war_state.json"
-
-LOCATION_CACHE_FILE = "location_cache.json"
-SG_RANK_CACHE_FILE = "sg_rank_cache.json"
 SG_RANK_CACHE_SECONDS = 600
 
 BOT_TIMEZONE = ZoneInfo("Asia/Singapore")
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+STATE_FILE = os.path.join(DATA_DIR, "clan_members_state.json")
+MESSAGE_STATE_FILE = os.path.join(DATA_DIR, "telegram_message_state.json")
+HOURLY_SNAPSHOT_FILE = os.path.join(DATA_DIR, "hourly_trophy_snapshot.json")
+WAR_STATE_FILE = os.path.join(DATA_DIR, "war_state.json")
+LOCATION_CACHE_FILE = os.path.join(DATA_DIR, "location_cache.json")
+SG_RANK_CACHE_FILE = os.path.join(DATA_DIR, "sg_rank_cache.json")
 
 CLASH_HEADERS = {
     "Authorization": f"Bearer {CLASH_API_TOKEN}"
@@ -35,6 +39,50 @@ ES_SYSTEM_REQUIRED = 0x00000001
 _instance_lock_file = None
 
 
+def ensure_full_clan_list_message(current_members):
+    saved_message_id = get_saved_message_id()
+
+    if saved_message_id:
+        log(f"Trying to re-edit old Telegram message: {saved_message_id}")
+        ok = update_full_clan_list_message(saved_message_id, current_members)
+        if ok:
+            return saved_message_id
+
+    log("Old message not usable. Sending one new full clan list message...")
+    result = send_full_clan_list(current_members)
+
+    if result and result.get("ok") and result.get("result"):
+        new_message_id = result["result"]["message_id"]
+        save_message_state(new_message_id)
+        return new_message_id
+
+    return saved_message_id
+
+
+def log(message):
+    now_text = datetime.now(BOT_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{now_text}] {message}", flush=True)
+
+
+def atomic_json_save(filepath, data):
+    temp_path = f"{filepath}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(temp_path, filepath)
+
+
+def load_json_file(filepath):
+    if not os.path.exists(filepath):
+        return None
+
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        log(f"Failed to load JSON file {filepath}: {e}")
+        return None
+
+
 def ensure_single_instance():
     global _instance_lock_file
 
@@ -42,14 +90,14 @@ def ensure_single_instance():
         mutex_name = "KopiOClanBotSingleInstance"
 
         kernel32 = ctypes.windll.kernel32
-        mutex = kernel32.CreateMutexW(None, False, mutex_name)
+        kernel32.CreateMutexW(None, False, mutex_name)
 
         ERROR_ALREADY_EXISTS = 183
         if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
             log("Another instance is already running. Exiting...")
             sys.exit(0)
 
-        return mutex
+        return True
 
     lock_path = "/tmp/KopiOClanBotSingleInstance.lock"
 
@@ -66,11 +114,6 @@ def ensure_single_instance():
     except Exception as e:
         log(f"Single-instance lock failed: {e}")
         return None
-
-
-def log(message):
-    now_text = datetime.now(BOT_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{now_text}] {message}", flush=True)
 
 
 def keep_awake():
@@ -164,9 +207,31 @@ def extract_path_of_legends(player_data):
 def format_path_of_legends(pol_data):
     if not pol_data:
         return "Unranked"
+    return pol_data.get("league_name", "Unranked")
 
-    league_name = pol_data.get("league_name", "Unranked")
-    return league_name
+
+def format_pol_detail_line(pol_data):
+    if not pol_data:
+        return "Unranked"
+
+    league = pol_data.get("league_name", "Unranked")
+    trophies = pol_data.get("trophies")
+    step = pol_data.get("step")
+    rank = pol_data.get("rank")
+
+    extras = []
+
+    if trophies is not None:
+        extras.append(f"Trophies: {trophies}")
+    if step is not None:
+        extras.append(f"Step: {step}")
+    if rank is not None:
+        extras.append(f"Rank: #{rank}")
+
+    if extras:
+        return f"{league} ({' | '.join(extras)})"
+
+    return league
 
 
 def get_clan_members():
@@ -209,35 +274,18 @@ def get_clan_score():
 
 
 def load_location_cache():
-    if not os.path.exists(LOCATION_CACHE_FILE):
-        return None
-
-    try:
-        with open(LOCATION_CACHE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        log(f"Failed to load location cache file: {e}")
-        return None
+    return load_json_file(LOCATION_CACHE_FILE)
 
 
 def save_location_cache(data):
     try:
-        with open(LOCATION_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        atomic_json_save(LOCATION_CACHE_FILE, data)
     except Exception as e:
         log(f"Failed to save location cache file: {e}")
 
 
 def load_sg_rank_cache():
-    if not os.path.exists(SG_RANK_CACHE_FILE):
-        return None
-
-    try:
-        with open(SG_RANK_CACHE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        log(f"Failed to load SG rank cache file: {e}")
-        return None
+    return load_json_file(SG_RANK_CACHE_FILE)
 
 
 def save_sg_rank_cache(rank_data, cache_time=None):
@@ -250,16 +298,15 @@ def save_sg_rank_cache(rank_data, cache_time=None):
     }
 
     try:
-        with open(SG_RANK_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        atomic_json_save(SG_RANK_CACHE_FILE, data)
     except Exception as e:
         log(f"Failed to save SG rank cache file: {e}")
 
 
 def get_location_id_by_name(location_name):
     cache = load_location_cache() or {}
-
     cached_id = cache.get(location_name)
+
     if cached_id is not None:
         return cached_id
 
@@ -269,8 +316,7 @@ def get_location_id_by_name(location_name):
     if not data:
         return None
 
-    items = data.get("items", [])
-    for item in items:
+    for item in data.get("items", []):
         if str(item.get("name", "")).strip().lower() == location_name.strip().lower():
             location_id = item.get("id")
             if location_id is not None:
@@ -324,7 +370,6 @@ def get_sg_clan_rank():
     if cache_data:
         cache_timestamp = cache_data.get("timestamp", 0)
         rank_data = cache_data.get("rank_data")
-
         if (time.time() - cache_timestamp) < SG_RANK_CACHE_SECONDS:
             return rank_data
 
@@ -345,55 +390,49 @@ def get_sg_clan_rank():
 
 
 def load_previous_members():
-    if not os.path.exists(STATE_FILE):
-        return None
-
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        log(f"Failed to load state file: {e}")
-        return None
+    return load_json_file(STATE_FILE)
 
 
 def save_members(members):
     try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(members, f, ensure_ascii=False, indent=2)
+        atomic_json_save(STATE_FILE, members)
     except Exception as e:
         log(f"Failed to save state file: {e}")
 
 
 def load_message_state():
-    if not os.path.exists(MESSAGE_STATE_FILE):
-        return None
-
-    try:
-        with open(MESSAGE_STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        log(f"Failed to load message state file: {e}")
-        return None
+    data = load_json_file(MESSAGE_STATE_FILE)
+    if data is not None:
+        log(f"Loaded message state: {data}")
+    else:
+        log(f"Message state file not found or unreadable: {MESSAGE_STATE_FILE}")
+    return data
 
 
 def save_message_state(message_id):
     try:
-        with open(MESSAGE_STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump({"message_id": message_id}, f, ensure_ascii=False, indent=2)
+        atomic_json_save(MESSAGE_STATE_FILE, {"message_id": message_id})
+        log(f"Saved message state file: {MESSAGE_STATE_FILE} | message_id={message_id}")
     except Exception as e:
         log(f"Failed to save message state file: {e}")
 
 
-def load_hourly_snapshot():
-    if not os.path.exists(HOURLY_SNAPSHOT_FILE):
-        return None
+def get_saved_message_id():
+    message_state = load_message_state()
+    if message_state and message_state.get("message_id"):
+        return message_state["message_id"]
+    return None
 
-    try:
-        with open(HOURLY_SNAPSHOT_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        log(f"Failed to load hourly snapshot file: {e}")
-        return None
+
+def load_hourly_snapshot():
+    data = load_json_file(HOURLY_SNAPSHOT_FILE)
+    if data:
+        ts = data.get("timestamp")
+        if ts:
+            log(f"Loaded hourly snapshot: {format_sgt_timestamp(ts)} | file={HOURLY_SNAPSHOT_FILE}")
+    else:
+        log(f"No hourly snapshot found at: {HOURLY_SNAPSHOT_FILE}")
+    return data
 
 
 def save_hourly_snapshot(members, snapshot_time=None):
@@ -406,47 +445,21 @@ def save_hourly_snapshot(members, snapshot_time=None):
     }
 
     try:
-        with open(HOURLY_SNAPSHOT_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        atomic_json_save(HOURLY_SNAPSHOT_FILE, data)
+        log(f"Saved hourly snapshot: {format_sgt_timestamp(snapshot_time)} | file={HOURLY_SNAPSHOT_FILE}")
     except Exception as e:
         log(f"Failed to save hourly snapshot file: {e}")
 
 
 def load_war_state():
-    if not os.path.exists(WAR_STATE_FILE):
-        return None
-
-    try:
-        with open(WAR_STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        log(f"Failed to load war state file: {e}")
-        return None
+    return load_json_file(WAR_STATE_FILE)
 
 
 def save_war_state(data):
     try:
-        with open(WAR_STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        atomic_json_save(WAR_STATE_FILE, data)
     except Exception as e:
         log(f"Failed to save war state file: {e}")
-
-
-def get_current_river_race():
-    url = f"https://api.clashroyale.com/v1/clans/{CLAN_TAG}/currentriverrace"
-    return clash_get(url)
-
-
-def get_war_phase():
-    data = get_current_river_race()
-
-    if not data:
-        return None
-
-    return {
-        "periodType": data.get("periodType"),
-        "periodIndex": data.get("periodIndex")
-    }
 
 
 def send_telegram_message(text):
@@ -496,7 +509,7 @@ def edit_telegram_message(message_id, text):
         return False
 
     if r.status_code == 200:
-        log("Telegram full list message edited.")
+        log(f"Telegram full list message edited. message_id={message_id}")
         return True
 
     try:
@@ -509,7 +522,7 @@ def edit_telegram_message(message_id, text):
         log("Telegram message already up to date. No edit needed.")
         return True
 
-    log(f"Telegram edit error: {r.status_code} {r.text}")
+    log(f"Telegram edit error for message_id={message_id}: {r.status_code} {description}")
     return False
 
 
@@ -552,22 +565,19 @@ def send_full_clan_list(members):
     return send_telegram_message(text)
 
 
-def update_full_clan_list_message(members):
+def update_full_clan_list_message(message_id, members):
+    if not message_id:
+        log("No saved message_id found. Skipping edit to avoid duplicate full list.")
+        return False
+
     text = build_full_clan_list_text(members)
-    message_state = load_message_state()
+    ok = edit_telegram_message(message_id, text)
 
-    if message_state and message_state.get("message_id"):
-        ok = edit_telegram_message(message_state["message_id"], text)
-        if ok:
-            return
+    if ok:
+        return True
 
-        log("Edit failed. Sending a new full clan list message instead...")
-
-    result = send_telegram_message(text)
-    if result and result.get("ok") and result.get("result"):
-        new_message_id = result["result"]["message_id"]
-        save_message_state(new_message_id)
-        log(f"Saved new full list message_id: {new_message_id}")
+    log("Edit failed. Not sending a new full list to avoid spam.")
+    return False
 
 
 def send_role_change_alert(name, tag, old_role, new_role, trophies, member_count):
@@ -583,13 +593,14 @@ def send_role_change_alert(name, tag, old_role, new_role, trophies, member_count
 
 
 def send_path_of_legends_change_alert(name, tag, old_pol, new_pol, member_count):
-    old_text = format_path_of_legends(old_pol)
-    new_text = format_path_of_legends(new_pol)
+    old_text = format_pol_detail_line(old_pol)
+    new_text = format_pol_detail_line(new_pol)
 
     msg = (
-        f"🎯 Path of Legends changed in Kopi O\n"
+        f"🎯 Path of Legends updated in Kopi O\n"
         f"👤 {name}\n"
-        f"🔄 {old_text} ➜ {new_text}\n"
+        f"🔄 {old_text}\n"
+        f"➡️ {new_text}\n"
         f"🔖 {tag}\n"
         f"📊 Members: {member_count}/50"
     )
@@ -645,41 +656,117 @@ def send_leave_alerts(left_tags, previous_members, current_count):
         log(f"Leave sent: {name} ({tag})")
 
 
-def send_clan_war_started_alert(war_info):
-    day = war_info.get("periodIndex", "?")
+def get_current_river_race():
+    url = f"https://api.clashroyale.com/v1/clans/{CLAN_TAG}/currentriverrace"
+    return clash_get(url)
 
-    msg = (
-        f"⚔️ Kopi O War Day {day} Started\n"
-        f"🔥 Good luck in battles!"
-    )
+
+def get_war_phase():
+    data = get_current_river_race()
+
+    if not data:
+        return None
+
+    section_index = data.get("sectionIndex")
+    period_type = data.get("periodType")
+    period_index = data.get("periodIndex")
+
+    # Detect war type from Clash API
+    is_colosseum = period_type == "colosseum"
+    is_normal_war = period_type != "colosseum"
+
+    # Same day mapping for both normal war and colosseum:
+    # 0,1,2 = training
+    # 3,4,5,6 = day 1,2,3,4
+    is_training_day = section_index in [0, 1, 2]
+    is_war_day = section_index in [3, 4, 5, 6]
+
+    return {
+        "sectionIndex": section_index,
+        "periodType": period_type,
+        "periodIndex": period_index,
+        "is_colosseum": is_colosseum,
+        "is_normal_war": is_normal_war,
+        "is_training_day": is_training_day,
+        "is_war_day": is_war_day
+    }
+
+
+def send_clan_war_day_alert(day_number, is_colosseum=False):
+    if is_colosseum:
+        msg = (
+            f"🏟️ Kopi O Colosseum Day {day_number} Started\n"
+            f"🔥 Good luck in battles!"
+        )
+    else:
+        msg = (
+            f"⚔️ Kopi O Clan War Day {day_number} Started\n"
+            f"🔥 Good luck in battles!"
+        )
+
     send_telegram_message(msg)
 
 
 def check_war_day_started():
-    previous_war = load_war_state()
+    previous_war = load_war_state() or {}
     current_war = get_war_phase()
 
     if current_war is None:
         log("Could not fetch current river race.")
         return
 
-    previous_period = previous_war.get("periodType") if previous_war else None
-    previous_index = previous_war.get("periodIndex") if previous_war else None
+    previous_section = previous_war.get("sectionIndex")
+    current_section = current_war.get("sectionIndex")
 
-    current_period = current_war.get("periodType")
-    current_index = current_war.get("periodIndex")
+    previous_period_type = previous_war.get("periodType")
+    current_period_type = current_war.get("periodType")
 
-    if current_period == "warDay":
-        # First time entering war day
-        if previous_period != "warDay":
-            send_clan_war_started_alert(current_war)
-            log(f"War day {current_index} started alert sent.")
+    previous_is_war_day = previous_war.get("is_war_day", False)
+    current_is_war_day = current_war.get("is_war_day", False)
 
-        # War day number changed (1 -> 2 -> 3 -> 4)
-        elif previous_index != current_index:
-            send_clan_war_started_alert(current_war)
-            log(f"War day {current_index} started alert sent.")
+    current_is_colosseum = current_war.get("is_colosseum", False)
 
+    # 🧪 Not a war day → just save state and exit
+    if not current_is_war_day:
+        save_war_state(current_war)
+        log(
+            f"No war alert sent. Training / non-war phase. "
+            f"periodType={current_period_type}, sectionIndex={current_section}"
+        )
+        return
+
+    # 📅 Calculate day number
+    if current_section is None:
+        log("Invalid sectionIndex received from API.")
+        save_war_state(current_war)
+        return
+
+    if current_is_colosseum:
+        current_day_number = current_section - 1
+    else:
+        current_day_number = current_section - 2
+
+    # 🚨 Determine if alert should be sent
+    should_alert = (
+        not previous_is_war_day
+        or previous_section != current_section
+        or previous_period_type != current_period_type
+    )
+
+    # 📢 Send alert if needed
+    if should_alert:
+        send_clan_war_day_alert(
+            day_number=current_day_number,
+            is_colosseum=current_is_colosseum
+        )
+        log(
+            f"War alert sent. "
+            f"periodType={current_period_type}, "
+            f"sectionIndex={current_section}, "
+            f"day={current_day_number}"
+        )
+
+    # 💾 Save latest state
     save_war_state(current_war)
 
 
@@ -704,12 +791,25 @@ def check_role_changes(previous_members, current_members):
             log(f"Role change sent: {name} ({tag}) {old_role} -> {new_role}")
 
 
+def has_role_changes(previous_members, current_members):
+    common_tags = set(previous_members.keys()) & set(current_members.keys())
+
+    for tag in common_tags:
+        old_role = previous_members[tag].get("role", "member")
+        new_role = current_members[tag].get("role", "member")
+
+        if old_role != new_role:
+            return True
+
+    return False
+
+
 def check_path_of_legends_changes(previous_members, current_members):
     common_tags = set(previous_members.keys()) & set(current_members.keys())
 
     for tag in common_tags:
-        old_pol = previous_members[tag].get("path_of_legends", {})
-        new_pol = current_members[tag].get("path_of_legends", {})
+        old_pol = previous_members[tag].get("path_of_legends", {}) or {}
+        new_pol = current_members[tag].get("path_of_legends", {}) or {}
 
         old_league = old_pol.get("league_number")
         new_league = new_pol.get("league_number")
@@ -720,7 +820,15 @@ def check_path_of_legends_changes(previous_members, current_members):
         old_step = old_pol.get("step")
         new_step = new_pol.get("step")
 
-        if old_league != new_league or old_trophies != new_trophies or old_step != new_step:
+        old_rank = old_pol.get("rank")
+        new_rank = new_pol.get("rank")
+
+        if (
+            old_league != new_league
+            or old_trophies != new_trophies
+            or old_step != new_step
+            or old_rank != new_rank
+        ):
             name = current_members[tag]["name"]
             send_path_of_legends_change_alert(
                 name=name,
@@ -732,7 +840,37 @@ def check_path_of_legends_changes(previous_members, current_members):
             log(f"Path of Legends change sent: {name} ({tag})")
 
 
-def has_trophy_changes(previous_members, current_members):
+def has_path_of_legends_changes(previous_members, current_members):
+    common_tags = set(previous_members.keys()) & set(current_members.keys())
+
+    for tag in common_tags:
+        old_pol = previous_members[tag].get("path_of_legends", {}) or {}
+        new_pol = current_members[tag].get("path_of_legends", {}) or {}
+
+        old_league = old_pol.get("league_number")
+        new_league = new_pol.get("league_number")
+
+        old_trophies = old_pol.get("trophies")
+        new_trophies = new_pol.get("trophies")
+
+        old_step = old_pol.get("step")
+        new_step = new_pol.get("step")
+
+        old_rank = old_pol.get("rank")
+        new_rank = new_pol.get("rank")
+
+        if (
+            old_league != new_league
+            or old_trophies != new_trophies
+            or old_step != new_step
+            or old_rank != new_rank
+        ):
+            return True
+
+    return False
+
+
+def has_member_trophy_changes(previous_members, current_members):
     common_tags = set(previous_members.keys()) & set(current_members.keys())
 
     for tag in common_tags:
@@ -740,25 +878,6 @@ def has_trophy_changes(previous_members, current_members):
         new_trophies = current_members[tag].get("trophies", 0)
 
         if old_trophies != new_trophies:
-            return True
-
-    return False
-
-
-def has_path_of_legends_changes(previous_members, current_members):
-    common_tags = set(previous_members.keys()) & set(current_members.keys())
-
-    for tag in common_tags:
-        old_pol = previous_members[tag].get("path_of_legends", {})
-        new_pol = current_members[tag].get("path_of_legends", {})
-
-        if old_pol.get("league_number") != new_pol.get("league_number"):
-            return True
-
-        if old_pol.get("trophies") != new_pol.get("trophies"):
-            return True
-
-        if old_pol.get("step") != new_pol.get("step"):
             return True
 
     return False
@@ -850,13 +969,13 @@ def build_hourly_trophy_summary_text(snapshot_members, current_members, snapshot
             )
 
     if joined_tags:
-        lines.append("\n🎉 Joined During This Hour")
+        lines.append("\n🎉 Joined During This Period")
         joined_names = sorted(current_members[tag]["name"] for tag in joined_tags)
         for i, name in enumerate(joined_names, start=1):
             lines.append(f"{i}. {name}")
 
     if left_tags:
-        lines.append("\n🚪 Left During This Hour")
+        lines.append("\n🚪 Left During This Period")
         left_names = sorted(snapshot_members[tag]["name"] for tag in left_tags)
         for i, name in enumerate(left_names, start=1):
             lines.append(f"{i}. {name}")
@@ -868,8 +987,8 @@ def maybe_send_hourly_trophy_summary(current_members):
     snapshot_data = load_hourly_snapshot()
 
     if snapshot_data is None:
+        log("No existing hourly snapshot. Creating first snapshot now.")
         save_hourly_snapshot(current_members)
-        log("Hourly snapshot file created.")
         return
 
     snapshot_timestamp = snapshot_data.get("timestamp", 0)
@@ -878,7 +997,19 @@ def maybe_send_hourly_trophy_summary(current_members):
     if not isinstance(snapshot_members, dict):
         snapshot_members = {}
 
+    if not snapshot_timestamp:
+        log("Snapshot timestamp missing or invalid. Resetting hourly snapshot.")
+        save_hourly_snapshot(current_members)
+        return
+
     elapsed = time.time() - snapshot_timestamp
+    remaining = HOURLY_SUMMARY_SECONDS - elapsed
+
+    log(
+        f"Hourly summary check | "
+        f"snapshot={format_sgt_timestamp(snapshot_timestamp)} | "
+        f"elapsed={int(elapsed)}s | remaining={max(0, int(remaining))}s"
+    )
 
     if elapsed < HOURLY_SUMMARY_SECONDS:
         return
@@ -888,6 +1019,7 @@ def maybe_send_hourly_trophy_summary(current_members):
         current_members=current_members,
         snapshot_timestamp=snapshot_timestamp
     )
+
     send_telegram_message(text)
     log("2 hour trophy summary sent.")
 
@@ -906,10 +1038,14 @@ def main():
         return
 
     keep_awake()
-    instance_mutex = ensure_single_instance()
+    ensure_single_instance()
+
     log("Bot started...")
-    log(f"Running file: {os.path.abspath(__file__)}")
     log(f"Process ID: {os.getpid()}")
+    log(f"DATA_DIR: {DATA_DIR}")
+    log(f"STATE_FILE: {STATE_FILE}")
+    log(f"MESSAGE_STATE_FILE: {MESSAGE_STATE_FILE}")
+    log(f"HOURLY_SNAPSHOT_FILE: {HOURLY_SNAPSHOT_FILE}")
 
     previous_members = load_previous_members()
     current_members = get_clan_members()
@@ -919,28 +1055,14 @@ def main():
         log("Failed to fetch clan members on startup. Bot will not continue.")
         return
 
-    if previous_members is None:
-        log("First run detected. Sending full clan list to Telegram...")
-        result = send_full_clan_list(current_members)
+    full_list_message_id = ensure_full_clan_list_message(current_members)
+    save_members(current_members)
 
-        if result and result.get("ok") and result.get("result"):
-            message_id = result["result"]["message_id"]
-            save_message_state(message_id)
-            log(f"Saved full list message_id: {message_id}")
-
-        save_members(current_members)
+    if load_hourly_snapshot() is None:
         save_hourly_snapshot(current_members)
-        log("Current members saved.")
-        previous_members = current_members
-    else:
-        update_full_clan_list_message(current_members)
-        save_members(current_members)
 
-        if load_hourly_snapshot() is None:
-            save_hourly_snapshot(current_members)
-
-        previous_members = current_members
-        log("Full clan list refreshed on startup.")
+    previous_members = current_members
+    log("Startup sync completed.")
 
     while True:
         try:
@@ -955,8 +1077,9 @@ def main():
 
             joined = set(current_members.keys()) - set(previous_members.keys())
             left = set(previous_members.keys()) - set(current_members.keys())
-            trophy_changed = has_trophy_changes(previous_members, current_members)
+            role_changed = has_role_changes(previous_members, current_members)
             pol_changed = has_path_of_legends_changes(previous_members, current_members)
+            trophy_changed = has_member_trophy_changes(previous_members, current_members)
 
             log(f"Checked clan. Current members: {len(current_members)}")
 
@@ -970,8 +1093,8 @@ def main():
             check_path_of_legends_changes(previous_members, current_members)
             send_clan_capacity_alert(len(previous_members), len(current_members))
 
-            if joined or left or trophy_changed or pol_changed:
-                update_full_clan_list_message(current_members)
+            if joined or left or role_changed or pol_changed or trophy_changed:
+                update_full_clan_list_message(full_list_message_id, current_members)
 
             maybe_send_hourly_trophy_summary(current_members)
 
